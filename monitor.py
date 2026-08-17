@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -100,6 +101,19 @@ def parse_odyssey_imax_showtimes(html: str) -> dict:
     return results
 
 
+def parse_date(date_str: str) -> datetime:
+    """
+    Parses a date string like "21 August 2026" into a real datetime so it
+    sorts chronologically. Falls back to datetime.min (sorts first/oldest)
+    if the format is ever unexpected, so a parse failure can't accidentally
+    make a bogus date look like the "latest" one.
+    """
+    try:
+        return datetime.strptime(date_str, "%d %B %Y")
+    except ValueError:
+        return datetime.min
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
@@ -152,18 +166,35 @@ def main() -> int:
     new_showtimes = diff_new_showtimes(previous, current)
 
     if new_showtimes:
-        lines = [f"New IMAX showtimes for {MOVIE_NAME} at Forum Cinemas Vingis:"]
-        for date in sorted(new_showtimes):
-            times = ", ".join(sorted(new_showtimes[date]))
-            lines.append(f"- {date}: {times}")
-        lines.append("")
+        # Sort chronologically (by real date), not alphabetically -- a
+        # plain string sort would put "10 August" before "9 August".
+        sorted_dates = sorted(new_showtimes, key=parse_date)
+        newest_date = sorted_dates[-1]
+        newest_times = ", ".join(sorted(new_showtimes[newest_date]))
+
+        lines = [
+            f"NEW furthest-out IMAX showtime for {MOVIE_NAME}!",
+            f"Latest date now bookable: {newest_date} ({newest_times})",
+            "",
+        ]
+
+        # If other new dates/times came in in the same run, list them too,
+        # but below the headline so the newest one is what you see first.
+        other_dates = sorted_dates[:-1]
+        if other_dates:
+            lines.append("Also newly added:")
+            for date in other_dates:
+                times = ", ".join(sorted(new_showtimes[date]))
+                lines.append(f"- {date}: {times}")
+            lines.append("")
+
         lines.append("Book here: https://forumcinemas.lt/en/")
         message = "\n".join(lines)
         print(message)
         send_telegram(message)
     else:
-        print("No new IMAX showtimes found. "
-              f"Currently tracked dates: {sorted(current.keys())}")
+        tracked = sorted(current.keys(), key=parse_date)
+        print(f"No new IMAX showtimes found. Currently tracked dates: {tracked}")
 
     save_state(current)
     return 0
