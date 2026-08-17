@@ -124,15 +124,13 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
 
-def diff_new_showtimes(old: dict, new: dict) -> dict:
-    """Return only the dates/times present in `new` but not in `old`."""
-    new_entries = {}
-    for date, times in new.items():
-        old_times = set(old.get(date, []))
-        added = [t for t in times if t not in old_times]
-        if added:
-            new_entries[date] = added
-    return new_entries
+def latest_date_and_times(showtimes: dict):
+    """Returns (date_str, sorted_times) for the furthest-out date in a
+    {date: [times]} dict, or (None, []) if the dict is empty."""
+    if not showtimes:
+        return None, []
+    latest = max(showtimes, key=parse_date)
+    return latest, sorted(showtimes[latest])
 
 
 def send_telegram(message: str) -> None:
@@ -163,38 +161,41 @@ def main() -> int:
     current = parse_odyssey_imax_showtimes(html)
     previous = load_state()
 
-    new_showtimes = diff_new_showtimes(previous, current)
+    current_latest_date, current_latest_times = latest_date_and_times(current)
+    previous_latest_date, previous_latest_times = latest_date_and_times(previous)
 
-    if new_showtimes:
-        # Sort chronologically (by real date), not alphabetically -- a
-        # plain string sort would put "10 August" before "9 August".
-        sorted_dates = sorted(new_showtimes, key=parse_date)
-        newest_date = sorted_dates[-1]
-        newest_times = ", ".join(sorted(new_showtimes[newest_date]))
+    if current_latest_date is None:
+        print(f"No IMAX showtimes currently published for {MOVIE_NAME}.")
+        save_state(current)
+        return 0
 
-        lines = [
-            f"NEW furthest-out IMAX showtime for {MOVIE_NAME}!",
-            f"Latest date now bookable: {newest_date} ({newest_times})",
-            "",
-        ]
+    frontier_advanced = (
+        previous_latest_date is None
+        or parse_date(current_latest_date) > parse_date(previous_latest_date)
+    )
+    same_date_new_times = (
+        not frontier_advanced
+        and current_latest_date == previous_latest_date
+        and current_latest_times != previous_latest_times
+    )
 
-        # If other new dates/times came in in the same run, list them too,
-        # but below the headline so the newest one is what you see first.
-        other_dates = sorted_dates[:-1]
-        if other_dates:
-            lines.append("Also newly added:")
-            for date in other_dates:
-                times = ", ".join(sorted(new_showtimes[date]))
-                lines.append(f"- {date}: {times}")
-            lines.append("")
-
-        lines.append("Book here: https://forumcinemas.lt/en/")
-        message = "\n".join(lines)
+    if frontier_advanced or same_date_new_times:
+        times_str = ", ".join(current_latest_times)
+        if frontier_advanced:
+            headline = f"NEW furthest-out IMAX date for {MOVIE_NAME}!"
+        else:
+            headline = f"New showtime added on the latest IMAX date for {MOVIE_NAME}!"
+        message = (
+            f"{headline}\n"
+            f"Latest date now bookable: {current_latest_date} ({times_str})\n\n"
+            f"Book here: https://forumcinemas.lt/en/"
+        )
         print(message)
         send_telegram(message)
     else:
         tracked = sorted(current.keys(), key=parse_date)
-        print(f"No new IMAX showtimes found. Currently tracked dates: {tracked}")
+        print(f"No change to the furthest-out date ({current_latest_date}). "
+              f"Currently tracked dates: {tracked}")
 
     save_state(current)
     return 0
