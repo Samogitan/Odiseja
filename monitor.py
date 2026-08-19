@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
 """
-Monitors Forum Cinemas Vingis (Vilnius) for new IMAX showtimes of "The Odyssey"
-and sends a Telegram message whenever a NEW date/showtime is published that
-wasn't seen on the previous run.
+Queries Forum Cinemas' real internal REST API (the one their own booking
+widget uses) for all published IMAX screenings of "The Odyssey" at Forum
+Cinemas Vingis, and sends a daily Telegram digest naming the single
+showing with the most available seats right now.
 
-Data source: kinoafisha.info's schedule page for Forum Cinemas Vingis.
-This mirrors forumcinemas.lt's own published schedule and is easier to
-parse reliably than the forumcinemas.lt site itself (which renders most
-content client-side / behind a different template per release).
+This replaces the old kinoafisha.info-scraping approach. That approach
+could only see published DATES, not seat counts, because Forum Cinemas'
+own site renders its schedule via JavaScript. The API below is what that
+JavaScript actually calls, discovered via browser dev tools -- it returns
+real, current seat availability directly, no scraping/parsing needed.
 
-If forumcinemas.lt changes its structure or you'd rather hit it directly,
-swap SCHEDULE_URL and rewrite `parse_odyssey_imax_showtimes()` accordingly
--- the rest of the script (state diffing + Telegram notify) stays the same.
-
-State is persisted to state.json so the script only alerts on genuinely
-NEW showtimes, not on every run.
+How the IDs below were found (documented for future maintenance):
+  - REGION_ID / CINEMA_ID: captured from the Network tab while browsing
+    forumcinemas.lt's schedule for Forum Cinemas Vingis.
+  - MOVIE_ID: identified by matching IMAX screenings' times against the
+    already-known Odyssey IMAX showtimes (12:30 / 16:20 / 20:10). The API
+    doesn't return movie titles, only this internal ID, so if Forum
+    Cinemas' IMAX screen moves on to a different film, this ID will
+    simply stop appearing and the script will report "no showings found"
+    rather than silently tracking the wrong movie.
 """
 
 import json
 import os
-import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 
-SCHEDULE_URL = "https://lt.kinoafisha.info/en/vilnius/cinema/8326312/schedule/"
-MOVIE_NAME = "The Odyssey"
-STATE_FILE = Path(__file__).parent / "state.json"
+REGION_ID = "e9202daa-51f9-4de9-8811-3076ad5449be"   # Vilnius region
+CINEMA_ID = "f933f355-2e6b-466f-9b97-e267ecd8e266"   # Forum Cinemas Vingis
+MOVIE_ID = "2a36684b-4f5e-4474-a3aa-9a86516cc5f1"    # The Odyssey
+
+API_BASE = "https://restapi.forumcinemas.lt/api"
+DAYS_AHEAD = 14   # how many days into the future to check
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -41,96 +47,78 @@ HEADERS = {
     )
 }
 
+VILNIUS_TZ = timezone(timedelta(hours=3))  # EEST; Vilnius is UTC+2/+3
 
-def fetch_page() -> str:
-    resp = requests.get(SCHEDULE_URL, headers=HEADERS, timeout=30)
+
+def fetch_screenings_for_day(day: datetime) -> list:
+    """Fetches all screenings at any cinema in the region for one
+    calendar day (day is a date-only datetime, time part ignored)."""
+    date_str = day.strftime("%Y-%m-%d")
+    dt_from = f"{date_str}T02:00:00.000"
+    next_day = (day + timedelta(days=1)).strftime("%Y-%m-%d")
+    dt_to = f"{next_day}T01:59:59.999"
+
+    url = f"{API_BASE}/region/{REGION_ID}/screening"
+    resp = requests.get(
+        url,
+        params={"dateTimeFrom": dt_from, "dateTimeTo": dt_to, "movieId": "null"},
+        headers=HEADERS,
+        timeout=30,
+    )
     resp.raise_for_status()
-    return resp.text
+    return resp.json()
 
 
-def parse_odyssey_imax_showtimes(html: str) -> dict:
-    """
-    Returns a dict of {date_string: [showtimes]} for IMAX screenings of
-    MOVIE_NAME. Date sections on the page look like:
-
-        ## Forum Cinemas Vingis schedule in Vilnius on 21 August 2026
-        ...
-        The Odyssey ...
-        2D, IMAX, SUB LT
-        12:30 20:10
-
-    We walk the page's headings in order, and within each date's section
-    look for the movie name followed by a line containing "IMAX", followed
-    by a line of HH:MM times.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    lines = [l for l in text.split("\n") if l.strip()]
-
-    results = {}
-    current_date = None
-    i = 0
-    date_re = re.compile(r"schedule in Vilnius on (.+)$")
-    time_re = re.compile(r"^\d{1,2}:\d{2}(\s+\d{1,2}:\d{2})*$")
-
-    while i < len(lines):
-        line = lines[i]
-        date_match = date_re.search(line)
-        if date_match:
-            current_date = date_match.group(1).strip()
-            i += 1
+def find_odyssey_imax_showings(screenings: list) -> list:
+    """Filters a list of raw screening dicts down to Odyssey IMAX
+    showings at the right cinema, returning simplified records with
+    computed seat availability."""
+    results = []
+    for s in screenings:
+        if s.get("cinemaId") != CINEMA_ID:
+            continue
+        if s.get("movieId") != MOVIE_ID:
+            continue
+        if "IMAX" not in (s.get("screenFeatures") or []):
             continue
 
-        if MOVIE_NAME.lower() in line.lower() and current_date:
-            # Scan forward a few lines for an "IMAX" format tag and a
-            # following line of showtimes.
-            for j in range(i, min(i + 8, len(lines))):
-                if "imax" in lines[j].lower():
-                    # times are usually 1-2 lines after the format tag
-                    for k in range(j, min(j + 3, len(lines))):
-                        if time_re.match(lines[k]):
-                            times = lines[k].split()
-                            results.setdefault(current_date, [])
-                            for t in times:
-                                if t not in results[current_date]:
-                                    results[current_date].append(t)
-                            break
-                    break
-        i += 1
+        max_occ = s.get("maxOccupancy") or 0
+        audience = s.get("audience") or 0
+        seats_left = max_occ - audience
 
+        results.append({
+            "id": s.get("id"),
+            "start": s.get("screeningTimeFrom"),
+            "seats_left": seats_left,
+            "max_occupancy": max_occ,
+            "audience": audience,
+        })
     return results
 
 
-def parse_date(date_str: str) -> datetime:
-    """
-    Parses a date string like "21 August 2026" into a real datetime so it
-    sorts chronologically. Falls back to datetime.min (sorts first/oldest)
-    if the format is ever unexpected, so a parse failure can't accidentally
-    make a bogus date look like the "latest" one.
-    """
-    try:
-        return datetime.strptime(date_str, "%d %B %Y")
-    except ValueError:
-        return datetime.min
+def collect_all_upcoming_showings() -> list:
+    """Walks forward day by day from today and collects every currently
+    published Odyssey IMAX showing found, across the whole DAYS_AHEAD
+    window."""
+    all_showings = []
+    today = datetime.now(VILNIUS_TZ)
+    for i in range(DAYS_AHEAD):
+        day = today + timedelta(days=i)
+        try:
+            screenings = fetch_screenings_for_day(day)
+        except requests.RequestException as e:
+            print(f"[warn] Failed to fetch {day.strftime('%Y-%m-%d')}: {e}",
+                  file=sys.stderr)
+            continue
+        all_showings.extend(find_odyssey_imax_showings(screenings))
+    return all_showings
 
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
-
-
-def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
-
-
-def latest_date_and_times(showtimes: dict):
-    """Returns (date_str, sorted_times) for the furthest-out date in a
-    {date: [times]} dict, or (None, []) if the dict is empty."""
-    if not showtimes:
-        return None, []
-    latest = max(showtimes, key=parse_date)
-    return latest, sorted(showtimes[latest])
+def format_showing(showing: dict) -> str:
+    start = datetime.fromisoformat(showing["start"])
+    when = start.strftime("%a %d %B, %H:%M")
+    return (f"{when} — {showing['seats_left']} seats left "
+            f"(out of {showing['max_occupancy']})")
 
 
 def send_telegram(message: str) -> None:
@@ -152,52 +140,38 @@ def send_telegram(message: str) -> None:
 
 
 def main() -> int:
-    try:
-        html = fetch_page()
-    except requests.RequestException as e:
-        print(f"[error] Failed to fetch schedule page: {e}", file=sys.stderr)
-        return 1
+    showings = collect_all_upcoming_showings()
 
-    current = parse_odyssey_imax_showtimes(html)
-    previous = load_state()
-
-    current_latest_date, current_latest_times = latest_date_and_times(current)
-    previous_latest_date, previous_latest_times = latest_date_and_times(previous)
-
-    if current_latest_date is None:
-        print(f"No IMAX showtimes currently published for {MOVIE_NAME}.")
-        save_state(current)
-        return 0
-
-    frontier_advanced = (
-        previous_latest_date is None
-        or parse_date(current_latest_date) > parse_date(previous_latest_date)
-    )
-    same_date_new_times = (
-        not frontier_advanced
-        and current_latest_date == previous_latest_date
-        and current_latest_times != previous_latest_times
-    )
-
-    if frontier_advanced or same_date_new_times:
-        times_str = ", ".join(current_latest_times)
-        if frontier_advanced:
-            headline = f"NEW furthest-out IMAX date for {MOVIE_NAME}!"
-        else:
-            headline = f"New showtime added on the latest IMAX date for {MOVIE_NAME}!"
+    if not showings:
         message = (
-            f"{headline}\n"
-            f"Latest date now bookable: {current_latest_date} ({times_str})\n\n"
-            f"Book here: https://forumcinemas.lt/en/"
+            "No IMAX showings of The Odyssey currently found at Forum "
+            "Cinemas Vingis in the published schedule. Either the run has "
+            "ended, or no dates are published yet."
         )
         print(message)
         send_telegram(message)
-    else:
-        tracked = sorted(current.keys(), key=parse_date)
-        print(f"No change to the furthest-out date ({current_latest_date}). "
-              f"Currently tracked dates: {tracked}")
+        return 0
 
-    save_state(current)
+    # Sort by most seats left, descending.
+    showings.sort(key=lambda s: s["seats_left"], reverse=True)
+    best = showings[0]
+    runner_ups = showings[1:4]  # next few, for context
+
+    lines = [
+        "Best seat availability today for The Odyssey (IMAX, Vingis):",
+        f"BEST: {format_showing(best)}",
+    ]
+    if runner_ups:
+        lines.append("")
+        lines.append("Other options:")
+        for s in runner_ups:
+            lines.append(f"- {format_showing(s)}")
+
+    lines.append("")
+    lines.append("Book here: https://forumcinemas.lt/en/")
+    message = "\n".join(lines)
+    print(message)
+    send_telegram(message)
     return 0
 
 
