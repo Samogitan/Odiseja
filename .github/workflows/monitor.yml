@@ -2,12 +2,11 @@ name: Odyssey IMAX Showtime Monitor
 
 on:
   schedule:
-    # Runs at 07:00, 13:00, and 19:00 UTC every day.
-    - cron: "0 7,13,19 * * *"
+    # Runs once daily at 06:00 UTC = 09:00 Vilnius time (EEST, summer).
+    # Adjust the hour if you want it earlier/later, or add more entries
+    # to the list to run more than once a day.
+    - cron: "0 6 * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
-
-permissions:
-  contents: write   # needed so the workflow can commit the updated state.json
 
 jobs:
   check-schedule:
@@ -16,7 +15,7 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Pythonåå
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -29,11 +28,3 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
-
-      - name: Commit updated state (if changed)
-        run: |
-          git config user.name "odyssey-monitor-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "Update showtime state [skip ci]"
-          git push
